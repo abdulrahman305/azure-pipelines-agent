@@ -76,6 +76,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
             _secretMasker.AddValueEncoder(ValueEncoders.JsonStringEscape);
             _secretMasker.AddValueEncoder(ValueEncoders.UriDataEscape);
             _secretMasker.AddValueEncoder(ValueEncoders.BackslashEscape);
+            _secretMasker.AddRegex(AdditionalMaskingRegexes.UrlSecretPattern);
             _traceManager = new TraceManager(traceListener, _secretMasker);
             _trace = GetTrace(nameof(TestHostContext));
 
@@ -201,6 +202,12 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
                         Constants.Path.LegacyPSHostDirectory);
                     break;
 
+                case WellKnownDirectory.LegacyPSHostLegacy:
+                    path = Path.Combine(
+                        GetDirectory(WellKnownDirectory.Externals),
+                        Constants.Path.LegacyPSHostLegacyDirectory);
+                    break;
+
                 case WellKnownDirectory.Root:
                     path = new DirectoryInfo(GetDirectory(WellKnownDirectory.Bin)).Parent.FullName;
                     break;
@@ -211,10 +218,22 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
                         Constants.Path.ServerOMDirectory);
                     break;
 
+                case WellKnownDirectory.ServerOMLegacy:
+                    path = Path.Combine(
+                        GetDirectory(WellKnownDirectory.Externals),
+                        Constants.Path.ServerOMLegacyDirectory);
+                    break;
+
                 case WellKnownDirectory.Tf:
                     path = Path.Combine(
                         GetDirectory(WellKnownDirectory.Externals),
                         Constants.Path.TfDirectory);
+                    break;
+
+                case WellKnownDirectory.TfLegacy:
+                    path = Path.Combine(
+                        GetDirectory(WellKnownDirectory.Externals),
+                        Constants.Path.TfLegacyDirectory);
                     break;
 
                 case WellKnownDirectory.Tee:

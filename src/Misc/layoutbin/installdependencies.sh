@@ -98,8 +98,8 @@ then
                 exit 1
             fi
 
-            # libicu versions: libicu70 -> libicu67 -> libicu66 -> libicu63 -> libicu60 -> libicu57 -> libicu55 -> libicu52
-            apt install -y libicu70 || apt install -y libicu67 || apt install  -y libicu66 || apt install -y libicu63 || apt install -y libicu60  || apt install -y libicu57 || apt install -y libicu55 || apt install -y libicu52
+            # libicu versions: libicu74 -> libicu70 -> libicu67 -> libicu66 -> libicu63 -> libicu60 -> libicu57 -> libicu55 -> libicu52
+            apt install -y libicu74 || apt install -y libicu70 || apt install -y libicu67 || apt install  -y libicu66 || apt install -y libicu63 || apt install -y libicu60  || apt install -y libicu57 || apt install -y libicu55 || apt install -y libicu52
             if [ $? -ne 0 ]
             then
                 echo "'apt' failed with exit code '$?'"
@@ -132,8 +132,8 @@ then
                     exit 1
                 fi
 
-                # libicu versions: libicu->70 libicu67 -> libicu66 -> libicu63 -> libicu60 -> libicu57 -> libicu55 -> libicu52
-                apt-get install -y libicu70 || apt-get install -y libicu67 || apt-get install -y libicu66 || apt-get install -y libicu63 || apt-get install -y libicu60 || apt-get install -y libicu57 || apt-get install -y libicu55 || apt-get install -y libicu52
+                # libicu versions: libicu74 -> libicu70 -> libicu67 -> libicu66 -> libicu63 -> libicu60 -> libicu57 -> libicu55 -> libicu52
+                apt-get install -y libicu74 || apt-get install -y libicu70 || apt-get install -y libicu67 || apt-get install -y libicu66 || apt-get install -y libicu63 || apt-get install -y libicu60 || apt-get install -y libicu57 || apt-get install -y libicu55 || apt-get install -y libicu52
                 if [ $? -ne 0 ]
                 then
                     echo "'apt-get' failed with exit code '$?'"
@@ -271,7 +271,7 @@ then
             is_sles=1
         fi
 
-        if  ([[ -n $OSTYPE ]] && ([[ $OSTYPE == *"suse"* ]]  || [[$is_sles == 1]]))
+        if  ([[ -n $OSTYPE ]] && ([[ $OSTYPE == *"suse"* ]] || ([[ -n $is_sles ]] && [[ $is_sles == 1 ]])))
         then
             echo "The current OS is SUSE based"
             command -v zypper
@@ -314,6 +314,28 @@ then
                 fi
             else
                 echo "Can not find 'yum'"
+                print_errormessage
+                exit 1
+            fi
+        elif [ -e /etc/azurelinux-release ]
+        then
+            echo "The current OS is Azure Linux based"
+            echo "--------Azure Linux Version--------"
+            cat /etc/azurelinux-release
+            echo "------------------------------"
+
+            command -v tdnf
+            if [ $? -eq 0 ]
+                then
+                tdnf install -y icu
+                if [ $? -ne 0 ]
+                then
+                    echo "'tdnf' failed with exit code '$?'"
+                    print_errormessage
+                    exit 1
+                fi
+            else
+                echo "Can not find 'tdnf'"
                 print_errormessage
                 exit 1
             fi

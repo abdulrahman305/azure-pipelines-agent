@@ -16,6 +16,9 @@ using System.Linq;
 using Microsoft.TeamFoundation.DistributedTask.WebApi;
 using Microsoft.VisualStudio.Services.WebApi;
 using Microsoft.VisualStudio.Services.Agent.Util;
+using Microsoft.Identity.Client;
+using Microsoft.VisualStudio.Services.Common;
+using System.Net;
 
 namespace Agent.Plugins.Repository
 {
@@ -189,6 +192,18 @@ namespace Agent.Plugins.Repository
         private const string _pullRefsPrefix = "refs/pull/";
         private const string _remotePullRefsPrefix = "refs/remotes/pull/";
 
+        private const string _tenantId = "tenantid";
+        private const string _clientId = "servicePrincipalId";
+
+        // client assertion type for jwt based token request required for authenticating work load identity auth scheme
+        private const string _clientAssertionType = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+
+        // entra URI to authenticate app registration/managed identity users
+        private const string _entraURI = "https://login.microsoftonline.com/{0}/oauth2/v2.0/token";
+
+        // All scopes for the Azure DevOps API resource
+        private const string _scopeId = "499b84ac-1321-427f-aa17-267ca6975798/.default";
+
         // min git version that support add extra auth header.
         protected Version _minGitVersionSupportAuthHeader = new Version(2, 9);
 
@@ -204,6 +219,9 @@ namespace Agent.Plugins.Repository
         // min git version that supports new way to pass config via --config-env
         // Info: https://github.com/git/git/commit/ce81b1da230cf04e231ce337c2946c0671ffb303
         protected Version _minGitVersionConfigEnv = new Version(2, 31);
+
+        // min git version that supports sparse checkout
+        protected Version _minGitVersionSupportSparseCheckout = new Version(2, 25);
 
         public abstract bool GitSupportUseAuthHeader(AgentTaskPluginExecutionContext executionContext, GitCliManager gitCommandManager);
         public abstract bool GitLfsSupportUseAuthHeader(AgentTaskPluginExecutionContext executionContext, GitCliManager gitCommandManager);
@@ -342,6 +360,10 @@ namespace Agent.Plugins.Repository
 
             string fetchFilter = executionContext.GetInput(Pipelines.PipelineConstants.CheckoutTaskInputs.FetchFilter);
 
+            string sparseCheckoutDirectories = executionContext.GetInput(Pipelines.PipelineConstants.CheckoutTaskInputs.SparseCheckoutDirectories);
+            string sparseCheckoutPatterns = executionContext.GetInput(Pipelines.PipelineConstants.CheckoutTaskInputs.SparseCheckoutPatterns);
+            bool enableSparseCheckout = !string.IsNullOrWhiteSpace(sparseCheckoutDirectories) || !string.IsNullOrWhiteSpace(sparseCheckoutPatterns);
+
             executionContext.Debug($"repository url={repositoryUrl}");
             executionContext.Debug($"targetPath={targetPath}");
             executionContext.Debug($"sourceBranch={sourceBranch}");
@@ -355,6 +377,7 @@ namespace Agent.Plugins.Repository
             executionContext.Debug($"fetchTags={fetchTags}");
             executionContext.Debug($"gitLfsSupport={gitLfsSupport}");
             executionContext.Debug($"acceptUntrustedCerts={acceptUntrustedCerts}");
+            executionContext.Debug($"sparseCheckout={enableSparseCheckout}");
 
             bool schannelSslBackend = StringUtil.ConvertToBoolean(executionContext.Variables.GetValueOrDefault("agent.gituseschannel")?.Value);
             executionContext.Debug($"schannelSslBackend={schannelSslBackend}");
@@ -454,6 +477,10 @@ namespace Agent.Plugins.Repository
                             // we have username, but no password
                             password = string.Empty;
                         }
+                        break;
+                    case EndpointAuthorizationSchemes.WorkloadIdentityFederation:
+                        username = EndpointAuthorizationSchemes.WorkloadIdentityFederation;
+                        password = GetWISCToken(endpoint, executionContext, cancellationToken);
                         break;
                     default:
                         executionContext.Warning($"Unsupport endpoint authorization schemes: {endpoint.Authorization.Scheme}");
@@ -675,6 +702,36 @@ namespace Agent.Plugins.Repository
                 }
             }
 
+            if (AgentKnobs.UseSparseCheckoutInCheckoutTask.GetValue(executionContext).AsBoolean())
+            {
+                // Sparse checkout needs to be before any `fetch` task to avoid fetching the excluded trees and blobs, or to not _not_ fetch them if we're disabling a previous sparse checkout.
+                if (enableSparseCheckout)
+                {
+                    gitCommandManager.EnsureGitVersion(_minGitVersionSupportSparseCheckout, throwOnNotMatch: true);
+
+                    // Set up sparse checkout
+                    int exitCode_sparseCheckout = await gitCommandManager.GitSparseCheckout(executionContext, targetPath, sparseCheckoutDirectories, sparseCheckoutPatterns, cancellationToken);
+                    if (exitCode_sparseCheckout != 0)
+                    {
+                        throw new InvalidOperationException($"Git sparse checkout failed with exit code: {exitCode_sparseCheckout}");
+                    }
+                }
+                else
+                {
+                    // Only disable if git supports sparse checkout
+                    if (gitCommandManager.EnsureGitVersion(_minGitVersionSupportSparseCheckout, throwOnNotMatch: false))
+                    {
+                        // Disable sparse checkout in case it was enabled in a previous checkout
+                        int exitCode_sparseCheckoutDisable = await gitCommandManager.GitSparseCheckoutDisable(executionContext, targetPath, cancellationToken);
+
+                        if (exitCode_sparseCheckoutDisable != 0)
+                        {
+                            throw new InvalidOperationException($"Git sparse checkout disable failed with exit code: {exitCode_sparseCheckoutDisable}");
+                        }
+                    }
+                }
+            }
+
             await RunGitStatusIfSystemDebug(executionContext, gitCommandManager, targetPath);
 
             cancellationToken.ThrowIfCancellationRequested();
@@ -718,8 +775,10 @@ namespace Agent.Plugins.Repository
                 await RemoveGitConfig(executionContext, gitCommandManager, targetPath, $"http.proxy", string.Empty);
             }
 
-            List<string> additionalFetchArgs = new List<string>();
-            List<string> additionalLfsFetchArgs = new List<string>();
+            var additionalFetchFilterOptions = ParseFetchFilterOptions(executionContext, fetchFilter);
+            var additionalFetchArgs = new List<string>();
+            var additionalLfsFetchArgs = new List<string>();
+            var additionalCheckoutArgs = new List<string>();
 
             // Force Git to HTTP/1.1. Otherwise IIS will reject large pushes to Azure Repos due to the large content-length header
             // This is caused by these header limits - https://docs.microsoft.com/en-us/iis/configuration/system.webserver/security/requestfiltering/requestlimits/headerlimits/
@@ -738,6 +797,11 @@ namespace Agent.Plugins.Repository
                     string configKey = "http.extraheader";
                     string args = ComposeGitArgs(executionContext, gitCommandManager, configKey, username, password, useBearerAuthType);
                     additionalFetchArgs.Add(args);
+
+                    if (additionalFetchFilterOptions.Any() && AgentKnobs.AddForceCredentialsToGitCheckout.GetValue(executionContext).AsBoolean())
+                    {
+                        additionalCheckoutArgs.Add(args);
+                    }
                 }
                 else
                 {
@@ -899,7 +963,7 @@ namespace Agent.Plugins.Repository
                 }
             }
 
-            int exitCode_fetch = await gitCommandManager.GitFetch(executionContext, targetPath, "origin", fetchDepth, fetchFilter, fetchTags, additionalFetchSpecs, string.Join(" ", additionalFetchArgs), cancellationToken);
+            int exitCode_fetch = await gitCommandManager.GitFetch(executionContext, targetPath, "origin", fetchDepth, additionalFetchFilterOptions, fetchTags, additionalFetchSpecs, string.Join(" ", additionalFetchArgs), cancellationToken);
             if (exitCode_fetch != 0)
             {
                 throw new InvalidOperationException($"Git fetch failed with exit code: {exitCode_fetch}");
@@ -911,7 +975,7 @@ namespace Agent.Plugins.Repository
             if (fetchByCommit && !string.IsNullOrEmpty(sourceVersion))
             {
                 List<string> commitFetchSpecs = new List<string>() { $"+{sourceVersion}" };
-                exitCode_fetch = await gitCommandManager.GitFetch(executionContext, targetPath, "origin", fetchDepth, fetchFilter, fetchTags, commitFetchSpecs, string.Join(" ", additionalFetchArgs), cancellationToken);
+                exitCode_fetch = await gitCommandManager.GitFetch(executionContext, targetPath, "origin", fetchDepth, additionalFetchFilterOptions, fetchTags, commitFetchSpecs, string.Join(" ", additionalFetchArgs), cancellationToken);
                 if (exitCode_fetch != 0)
                 {
                     throw new InvalidOperationException($"Git fetch failed with exit code: {exitCode_fetch}");
@@ -963,7 +1027,7 @@ namespace Agent.Plugins.Repository
             }
 
             // Finally, checkout the sourcesToBuild (if we didn't find a valid git object this will throw)
-            int exitCode_checkout = await gitCommandManager.GitCheckout(executionContext, targetPath, sourcesToBuild, cancellationToken);
+            int exitCode_checkout = await gitCommandManager.GitCheckout(executionContext, targetPath, sourcesToBuild, string.Join(" ", additionalCheckoutArgs), cancellationToken);
             if (exitCode_checkout != 0)
             {
                 // local repository is shallow repository, checkout may fail due to lack of commits history.
@@ -1374,6 +1438,59 @@ namespace Agent.Plugins.Repository
             }
         }
 
+        private IEnumerable<string> ParseFetchFilterOptions(AgentTaskPluginExecutionContext context, string fetchFilter)
+        {
+            if (!AgentKnobs.UseFetchFilterInCheckoutTask.GetValue(context).AsBoolean())
+            {
+                return Enumerable.Empty<string>();
+            }
+
+            if (string.IsNullOrEmpty(fetchFilter))
+            {
+                return Enumerable.Empty<string>();
+            }
+
+            // parse filter and only include valid options
+            var filters = new List<string>();
+            var splitFilter = fetchFilter.Split('+').Where(filter => !string.IsNullOrWhiteSpace(filter)).ToList();
+
+            foreach (string filter in splitFilter)
+            {
+                var parsedFilter = filter.Split(':')
+                    .Where(filter => !string.IsNullOrWhiteSpace(filter))
+                    .Select(filter => filter.Trim())
+                    .ToList();
+
+                if (parsedFilter.Count == 2)
+                {
+                    switch (parsedFilter[0].ToLower())
+                    {
+                        case "tree":
+                            // currently only supporting treeless filter
+                            if (int.TryParse(parsedFilter[1], out int treeSize) && treeSize == 0)
+                            {
+                                filters.Add($"{parsedFilter[0]}:{treeSize}");
+                            }
+                            break;
+
+                        case "blob":
+                            // currently only supporting blobless filter
+                            if (parsedFilter[1].Equals("none", StringComparison.OrdinalIgnoreCase))
+                            {
+                                filters.Add($"{parsedFilter[0]}:{parsedFilter[1]}");
+                            }
+                            break;
+
+                        default:
+                            // either invalid or unsupported git object
+                            break;
+                    }
+                }
+            }
+
+            return filters;
+        }
+
         private async Task RunGitStatusIfSystemDebug(AgentTaskPluginExecutionContext executionContext, GitCliManager gitCommandManager, string targetPath)
         {
             if (executionContext.IsSystemDebugTrue())
@@ -1538,6 +1655,39 @@ namespace Agent.Plugins.Repository
             }
         }
 
+        protected virtual string GetWISCToken(ServiceEndpoint endpoint, AgentTaskPluginExecutionContext executionContext, CancellationToken cancellationToken)
+        {
+            var tenantId = "";
+            var clientId = "";
+            endpoint.Authorization?.Parameters?.TryGetValue(_tenantId, out tenantId);
+            endpoint.Authorization?.Parameters?.TryGetValue(_clientId, out clientId);
+
+            var app = ConfidentialClientApplicationBuilder.Create(clientId)
+                .WithAuthority(string.Format(_entraURI, tenantId))
+                .WithRedirectUri(_clientAssertionType)
+                .WithClientAssertion(async (AssertionRequestOptions options) =>
+                {
+                    var systemConnection = executionContext.Endpoints.SingleOrDefault(x => string.Equals(x.Name, WellKnownServiceEndpointNames.SystemVssConnection, StringComparison.Ordinal));
+                    ArgUtil.NotNull(systemConnection, nameof(systemConnection));
+                    VssCredentials vssCredentials = VssUtil.GetVssCredential(systemConnection);
+                    var collectionUri = new Uri(executionContext.Variables.GetValueOrDefault("system.collectionuri")?.Value);
+                    using VssConnection vssConnection = VssUtil.CreateConnection(collectionUri, vssCredentials, trace: null);
+                    TaskHttpClient taskClient = vssConnection.GetClient<TaskHttpClient>();
+                    var idToken = await taskClient.CreateOidcTokenAsync(
+                        scopeIdentifier: new Guid(executionContext.Variables.GetValueOrDefault("system.teamprojectid")?.Value),
+                        hubName: executionContext.Variables.GetValueOrDefault("system.hosttype")?.Value,
+                        planId: new Guid(executionContext.Variables.GetValueOrDefault("system.planid")?.Value),
+                        jobId: new Guid(executionContext.Variables.GetValueOrDefault("system.jobId")?.Value),
+                        serviceConnectionId: endpoint.Id,
+                        claims: null,
+                        cancellationToken: cancellationToken
+                    );
+                    return idToken.OidcToken;
+                })
+                .Build();
+            var authenticationResult = app.AcquireTokenForClient(new string[] { _scopeId }).ExecuteAsync(cancellationToken).GetAwaiter().GetResult();
+            return authenticationResult.AccessToken;
+        }
         private async Task SetAuthTokenInGitConfig(AgentTaskPluginExecutionContext executionContext,
             GitCliManager gitCommandManager,
             string targetPath,

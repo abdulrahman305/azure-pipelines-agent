@@ -50,12 +50,14 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         #region MetricStructs
         private struct CpuInfo
         {
+            public bool IsProcRunning;
             public DateTime Updated;
             public double Usage;
         }
 
         private struct DiskInfo
         {
+            public bool IsProcRunning;
             public DateTime Updated;
             public double TotalDiskSpaceMB;
             public double FreeDiskSpaceMB;
@@ -64,6 +66,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
 
         public struct MemoryInfo
         {
+            public bool IsProcRunning;
             public DateTime Updated;
             public long TotalMemoryMB;
             public long UsedMemoryMB;
@@ -111,123 +114,128 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         #endregion
 
         #region MetricMethods
-        private async Task GetCpuInfoAsync()
+        private async Task GetCpuInfoAsync(CancellationToken cancellationToken)
         {
             if (_cpuInfo.Updated >= DateTime.Now - TimeSpan.FromMilliseconds(METRICS_UPDATE_INTERVAL))
             {
                 return;
             }
 
-            if (PlatformUtil.RunningOnWindows)
+            lock (_cpuInfoLock)
             {
-                using var timeoutTokenSource = new CancellationTokenSource();
-                timeoutTokenSource.CancelAfter(TimeSpan.FromMilliseconds(METRICS_UPDATE_INTERVAL));
-
-                using var linkedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(
-                    _context.CancellationToken,
-                    timeoutTokenSource.Token);
-
-                await Task.Run(() =>
+                if (_cpuInfo.IsProcRunning)
                 {
-                    using var query = new ManagementObjectSearcher("SELECT PercentIdleTime FROM Win32_PerfFormattedData_PerfOS_Processor WHERE Name=\"_Total\"");
+                    return;
+                }
+                _cpuInfo.IsProcRunning = true;
+            }
 
-                    ManagementObject cpuInfo = query.Get().OfType<ManagementObject>().FirstOrDefault() ?? throw new Exception("Failed to execute WMI query");
-                    var cpuInfoIdle = Convert.ToDouble(cpuInfo["PercentIdleTime"]);
+            try
+            {
+                if (PlatformUtil.RunningOnWindows)
+                {
+                    await Task.Run(() =>
+                    {
+                        using var query = new ManagementObjectSearcher("SELECT PercentIdleTime FROM Win32_PerfFormattedData_PerfOS_Processor WHERE Name=\"_Total\"");
+
+                        ManagementObject cpuInfo = query.Get().OfType<ManagementObject>().FirstOrDefault() ?? throw new Exception("Failed to execute WMI query");
+                        var cpuInfoIdle = Convert.ToDouble(cpuInfo["PercentIdleTime"]);
+
+                        lock (_cpuInfoLock)
+                        {
+                            _cpuInfo.Updated = DateTime.Now;
+                            _cpuInfo.Usage = 100 - cpuInfoIdle;
+                        }
+                    }, cancellationToken);
+                }
+
+                if (PlatformUtil.RunningOnLinux)
+                {
+                    List<float[]> samples = new();
+                    int samplesCount = 10;
+
+                    // /proc/stat updates linearly in real time and shows CPU time counters during the whole system uptime
+                    // so we need to collect multiple samples to calculate CPU usage
+                    for (int i = 0; i < samplesCount + 1; i++)
+                    {
+                        string[] strings = await File.ReadAllLinesAsync("/proc/stat", cancellationToken);
+                        if (cancellationToken.IsCancellationRequested)
+                        {
+                            return;
+                        }
+
+                        samples.Add(strings[0]
+                                .Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                                .Skip(1)
+                                .Select(float.Parse)
+                                .ToArray());
+
+                        await Task.Delay(100, cancellationToken);
+                    }
+
+                    // The CPU time counters in the /proc/stat are:
+                    // user, nice, system, idle, iowait, irq, softirq, steal, guest, guest_nice
+                    //
+                    // We need to get deltas for idle and total CPU time using the gathered samples
+                    // and calculate the average to provide the CPU utilization in the moment
+                    double cpuUsage = 0.0;
+                    for (int i = 1; i < samplesCount + 1; i++)
+                    {
+                        double idle = samples[i][3] - samples[i - 1][3];
+                        double total = samples[i].Sum() - samples[i - 1].Sum();
+
+                        cpuUsage += 1.0 - (idle / total);
+                    }
+
+                    lock (_cpuInfoLock)
+                    {
+                        _cpuInfo.Updated = DateTime.Now;
+                        _cpuInfo.Usage = (cpuUsage / samplesCount) * 100;
+                    }
+                }
+
+                if (PlatformUtil.RunningOnMacOS)
+                {
+                    using var processInvoker = HostContext.CreateService<IProcessInvoker>();
+
+                    List<string> outputs = new List<string>();
+                    processInvoker.OutputDataReceived += delegate (object sender, ProcessDataReceivedEventArgs message)
+                    {
+                        outputs.Add(message.Data);
+                    };
+
+                    processInvoker.ErrorDataReceived += delegate (object sender, ProcessDataReceivedEventArgs message)
+                    {
+                        Trace.Error($"Error on receiving CPU info: {message.Data}");
+                    };
+
+                    var filePath = "/bin/bash";
+                    var arguments = "-c \"top -l 2 -o cpu | grep ^CPU\"";
+
+                    await processInvoker.ExecuteAsync(
+                            workingDirectory: string.Empty,
+                            fileName: filePath,
+                            arguments: arguments,
+                            environment: null,
+                            requireExitCodeZero: true,
+                            outputEncoding: null,
+                            killProcessOnCancel: true,
+                            cancellationToken: cancellationToken);
+                    // Use second sample for more accurate calculation
+                    var cpuInfoIdle = double.Parse(outputs[1].Split(' ', (char)StringSplitOptions.RemoveEmptyEntries)[6].Trim('%'));
 
                     lock (_cpuInfoLock)
                     {
                         _cpuInfo.Updated = DateTime.Now;
                         _cpuInfo.Usage = 100 - cpuInfoIdle;
                     }
-                }, linkedTokenSource.Token);
+                }
             }
-
-            if (PlatformUtil.RunningOnLinux)
+            finally
             {
-                using var processInvoker = HostContext.CreateService<IProcessInvoker>();
-
-                using var timeoutTokenSource = new CancellationTokenSource();
-                timeoutTokenSource.CancelAfter(TimeSpan.FromMilliseconds(METRICS_UPDATE_INTERVAL));
-
-                using var linkedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(
-                    _context.CancellationToken,
-                    timeoutTokenSource.Token);
-
-                processInvoker.OutputDataReceived += delegate (object sender, ProcessDataReceivedEventArgs message)
-                {
-                    var processInvokerOutput = message.Data;
-
-                    var cpuInfoNice = int.Parse(processInvokerOutput.Split(' ', (char)StringSplitOptions.RemoveEmptyEntries)[2]);
-                    var cpuInfoIdle = int.Parse(processInvokerOutput.Split(' ', (char)StringSplitOptions.RemoveEmptyEntries)[4]);
-                    var cpuInfoIOWait = int.Parse(processInvokerOutput.Split(' ', (char)StringSplitOptions.RemoveEmptyEntries)[5]);
-
-                    lock (_cpuInfoLock)
-                    {
-                        _cpuInfo.Updated = DateTime.Now;
-                        _cpuInfo.Usage = (double)(cpuInfoNice + cpuInfoIdle) * 100 / (cpuInfoNice + cpuInfoIdle + cpuInfoIOWait);
-                    }
-                };
-
-                processInvoker.ErrorDataReceived += delegate (object sender, ProcessDataReceivedEventArgs message)
-                {
-                    Trace.Error($"Error on receiving CPU info: {message.Data}");
-                };
-
-                var filePath = "grep";
-                var arguments = "\"cpu \" /proc/stat";
-                await processInvoker.ExecuteAsync(
-                        workingDirectory: string.Empty,
-                        fileName: filePath,
-                        arguments: arguments,
-                        environment: null,
-                        requireExitCodeZero: true,
-                        outputEncoding: null,
-                        killProcessOnCancel: true,
-                        cancellationToken: linkedTokenSource.Token);
-            }
-
-            if (PlatformUtil.RunningOnMacOS)
-            {
-                List<string> outputs = new List<string>();
-
-                using var processInvoker = HostContext.CreateService<IProcessInvoker>();
-
-                using var timeoutTokenSource = new CancellationTokenSource();
-                timeoutTokenSource.CancelAfter(TimeSpan.FromMilliseconds(METRICS_UPDATE_INTERVAL));
-
-                using var linkedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(
-                    _context.CancellationToken,
-                    timeoutTokenSource.Token);
-
-                processInvoker.OutputDataReceived += delegate (object sender, ProcessDataReceivedEventArgs message)
-                {
-                    outputs.Add(message.Data);
-                };
-
-                processInvoker.ErrorDataReceived += delegate (object sender, ProcessDataReceivedEventArgs message)
-                {
-                    Trace.Error($"Error on receiving CPU info: {message.Data}");
-                };
-
-                var filePath = "/bin/bash";
-                var arguments = "-c \"top -l 2 -o cpu | grep ^CPU\"";
-                await processInvoker.ExecuteAsync(
-                        workingDirectory: string.Empty,
-                        fileName: filePath,
-                        arguments: arguments,
-                        environment: null,
-                        requireExitCodeZero: true,
-                        outputEncoding: null,
-                        killProcessOnCancel: true,
-                        cancellationToken: linkedTokenSource.Token);
-
-                // Use second sample for more accurate calculation
-                var cpuInfoIdle = double.Parse(outputs[1].Split(' ', (char)StringSplitOptions.RemoveEmptyEntries)[6].Trim('%'));
-
                 lock (_cpuInfoLock)
                 {
-                    _cpuInfo.Updated = DateTime.Now;
-                    _cpuInfo.Usage = 100 - cpuInfoIdle;
+                    _cpuInfo.IsProcRunning = false;
                 }
             }
         }
@@ -239,180 +247,164 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                 return;
             }
 
-            string root = Path.GetPathRoot(_context.GetVariableValueOrDefault(Constants.Variables.Agent.WorkFolder));
-            var driveInfo = new DriveInfo(root);
-
             lock (_diskInfoLock)
             {
-                _diskInfo.Updated = DateTime.Now;
-                _diskInfo.TotalDiskSpaceMB = (double)driveInfo.TotalSize / 1048576;
-                _diskInfo.FreeDiskSpaceMB = (double)driveInfo.AvailableFreeSpace / 1048576;
-                _diskInfo.VolumeRoot = root;
+                if (_diskInfo.IsProcRunning)
+                {
+                    return;
+                }
+                _diskInfo.IsProcRunning = true;
+            }
+
+            try
+            {
+                string root = Path.GetPathRoot(_context.GetVariableValueOrDefault(Constants.Variables.Agent.WorkFolder));
+                var driveInfo = new DriveInfo(root);
+
+                lock (_diskInfoLock)
+                {
+                    _diskInfo.Updated = DateTime.Now;
+                    _diskInfo.TotalDiskSpaceMB = (double)driveInfo.TotalSize / 1048576;
+                    _diskInfo.FreeDiskSpaceMB = (double)driveInfo.AvailableFreeSpace / 1048576;
+                    _diskInfo.VolumeRoot = root;
+                }
+            }
+            finally
+            {
+                lock (_diskInfoLock)
+                {
+                    _diskInfo.IsProcRunning = false;
+                }
             }
         }
 
-        private async Task GetMemoryInfoAsync()
+        private async Task GetMemoryInfoAsync(CancellationToken cancellationToken)
         {
             if (_memoryInfo.Updated >= DateTime.Now - TimeSpan.FromMilliseconds(METRICS_UPDATE_INTERVAL))
             {
                 return;
             }
 
-            if (PlatformUtil.RunningOnWindows)
+            lock (_memoryInfoLock)
             {
-                using var timeoutTokenSource = new CancellationTokenSource();
-                timeoutTokenSource.CancelAfter(TimeSpan.FromMilliseconds(METRICS_UPDATE_INTERVAL));
-
-                using var linkedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(
-                    _context.CancellationToken,
-                    timeoutTokenSource.Token);
-
-                await Task.Run(() =>
+                if (_memoryInfo.IsProcRunning)
                 {
-                    using var query = new ManagementObjectSearcher("SELECT FreePhysicalMemory, TotalVisibleMemorySize FROM CIM_OperatingSystem");
+                    return;
+                }
+                _memoryInfo.IsProcRunning = true;
+            }
 
-                    ManagementObject memoryInfo = query.Get().OfType<ManagementObject>().FirstOrDefault() ?? throw new Exception("Failed to execute WMI query");
-                    var freeMemory = Convert.ToInt64(memoryInfo["FreePhysicalMemory"]);
-                    var totalMemory = Convert.ToInt64(memoryInfo["TotalVisibleMemorySize"]);
+            try
+            {
+                if (PlatformUtil.RunningOnWindows)
+                {
+                    await Task.Run(() =>
+                    {
+                        using var query = new ManagementObjectSearcher("SELECT FreePhysicalMemory, TotalVisibleMemorySize FROM CIM_OperatingSystem");
+
+                        ManagementObject memoryInfo = query.Get().OfType<ManagementObject>().FirstOrDefault() ?? throw new Exception("Failed to execute WMI query");
+                        var freeMemory = Convert.ToInt64(memoryInfo["FreePhysicalMemory"]);
+                        var totalMemory = Convert.ToInt64(memoryInfo["TotalVisibleMemorySize"]);
+
+                        lock (_memoryInfoLock)
+                        {
+                            _memoryInfo.Updated = DateTime.Now;
+                            _memoryInfo.TotalMemoryMB = totalMemory / 1024;
+                            _memoryInfo.UsedMemoryMB = (totalMemory - freeMemory) / 1024;
+                        }
+                    }, cancellationToken);
+                }
+
+                if (PlatformUtil.RunningOnLinux)
+                {
+                    string[] memoryInfo = await File.ReadAllLinesAsync("/proc/meminfo", cancellationToken);
+                    if (cancellationToken.IsCancellationRequested)
+                    {
+                        return;
+                    }
+
+                    // The /proc/meminfo file contains several memory counters. To calculate the available memory
+                    // we need to get the total memory and the available memory counters
+                    // The available memory contains the sum of free, cached, and buffer memory
+                    // it shows more accurate information about the memory usage than the free memory counter
+                    int totalMemory = int.Parse(memoryInfo[0].Split(" ", StringSplitOptions.RemoveEmptyEntries)[1]);
+                    int availableMemory = int.Parse(memoryInfo[2].Split(" ", StringSplitOptions.RemoveEmptyEntries)[1]);
 
                     lock (_memoryInfoLock)
                     {
                         _memoryInfo.Updated = DateTime.Now;
                         _memoryInfo.TotalMemoryMB = totalMemory / 1024;
-                        _memoryInfo.UsedMemoryMB = (totalMemory - freeMemory) / 1024;
+                        _memoryInfo.UsedMemoryMB = (totalMemory - availableMemory) / 1024;
                     }
-                }, linkedTokenSource.Token);
-            }
+                }
 
-            if (PlatformUtil.RunningOnLinux)
-            {
-                // Some compact Linux distributions like UBI may not have "free" utility installed, or it may have a custom output
-                // We don't want to break currently existing pipelines with ADO warnings
-                // so related errors thrown here will be sent to the trace or debug logs by caller methods
-
-                using var processInvoker = HostContext.CreateService<IProcessInvoker>();
-
-                using var timeoutTokenSource = new CancellationTokenSource();
-                timeoutTokenSource.CancelAfter(TimeSpan.FromMilliseconds(METRICS_UPDATE_INTERVAL));
-
-                using var linkedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(
-                    _context.CancellationToken,
-                    timeoutTokenSource.Token);
-
-                processInvoker.OutputDataReceived += delegate (object sender, ProcessDataReceivedEventArgs message)
+                if (PlatformUtil.RunningOnMacOS)
                 {
-                    if (!message.Data.StartsWith("Mem:"))
+                    // vm_stat allows to get the most detailed information about memory usage on MacOS
+                    // but unfortunately it returns values in pages and has no built-in arguments for custom output
+                    // so we need to parse and cast the output manually
+
+                    using var processInvoker = HostContext.CreateService<IProcessInvoker>();
+
+                    List<string> outputs = new List<string>();
+                    processInvoker.OutputDataReceived += delegate (object sender, ProcessDataReceivedEventArgs message)
                     {
-                        return;
-                    }
+                        outputs.Add(message.Data);
+                    };
 
-                    var processInvokerOutputString = message.Data;
-                    var memoryInfoString = processInvokerOutputString.Split(" ", StringSplitOptions.RemoveEmptyEntries);
-
-                    if (memoryInfoString.Length != 7)
+                    processInvoker.ErrorDataReceived += delegate (object sender, ProcessDataReceivedEventArgs message)
                     {
-                        throw new Exception("\"free\" utility has non-default output");
-                    }
+                        Trace.Error($"Error on receiving memory info: {message.Data}");
+                    };
 
-                    lock (_memoryInfoLock)
-                    {
-                        _memoryInfo.Updated = DateTime.Now;
-                        _memoryInfo.TotalMemoryMB = long.Parse(memoryInfoString[1]);
-                        _memoryInfo.UsedMemoryMB = long.Parse(memoryInfoString[2]);
-                    }
-                };
+                    var filePath = "vm_stat";
 
-                processInvoker.ErrorDataReceived += delegate (object sender, ProcessDataReceivedEventArgs message)
-                {
-                    Trace.Error($"Error on receiving memory info: {message.Data}");
-                };
-
-                try
-                {
-                    var filePath = "free";
-                    var arguments = "-m";
                     await processInvoker.ExecuteAsync(
                             workingDirectory: string.Empty,
                             fileName: filePath,
-                            arguments: arguments,
+                            arguments: string.Empty,
                             environment: null,
                             requireExitCodeZero: true,
                             outputEncoding: null,
                             killProcessOnCancel: true,
-                            cancellationToken: linkedTokenSource.Token);
-                }
-                catch (Win32Exception ex)
-                {
-                    throw new Exception($"\"free\" utility is unavailable. Exception: {ex.Message}");
+                            cancellationToken: cancellationToken);
+
+                    var pageSize = int.Parse(outputs[0].Split(" ", StringSplitOptions.RemoveEmptyEntries)[7]);
+
+                    var pagesFree = long.Parse(outputs[1].Split(" ", StringSplitOptions.RemoveEmptyEntries)[2].Trim('.'));
+                    var pagesActive = long.Parse(outputs[2].Split(" ", StringSplitOptions.RemoveEmptyEntries)[2].Trim('.'));
+                    var pagesInactive = long.Parse(outputs[3].Split(" ", StringSplitOptions.RemoveEmptyEntries)[2].Trim('.'));
+                    var pagesSpeculative = long.Parse(outputs[4].Split(" ", StringSplitOptions.RemoveEmptyEntries)[2].Trim('.'));
+                    var pagesWiredDown = long.Parse(outputs[6].Split(" ", StringSplitOptions.RemoveEmptyEntries)[3].Trim('.'));
+                    var pagesOccupied = long.Parse(outputs[16].Split(" ", StringSplitOptions.RemoveEmptyEntries)[4].Trim('.'));
+
+                    var freeMemory = (pagesFree + pagesInactive) * pageSize;
+                    var usedMemory = (pagesActive + pagesSpeculative + pagesWiredDown + pagesOccupied) * pageSize;
+
+                    lock (_memoryInfoLock)
+                    {
+                        _memoryInfo.Updated = DateTime.Now;
+                        _memoryInfo.TotalMemoryMB = (freeMemory + usedMemory) / 1048576;
+                        _memoryInfo.UsedMemoryMB = usedMemory / 1048576;
+                    }
                 }
             }
-
-            if (PlatformUtil.RunningOnMacOS)
+            finally
             {
-                // vm_stat allows to get the most detailed information about memory usage on MacOS
-                // but unfortunately it returns values in pages and has no built-in arguments for custom output
-                // so we need to parse and cast the output manually
-
-                List<string> outputs = new List<string>();
-
-                using var processInvoker = HostContext.CreateService<IProcessInvoker>();
-
-                using var timeoutTokenSource = new CancellationTokenSource();
-                timeoutTokenSource.CancelAfter(TimeSpan.FromMilliseconds(METRICS_UPDATE_INTERVAL));
-
-                using var linkedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(
-                    _context.CancellationToken,
-                    timeoutTokenSource.Token);
-
-                processInvoker.OutputDataReceived += delegate (object sender, ProcessDataReceivedEventArgs message)
-                {
-                    outputs.Add(message.Data);
-                };
-
-                processInvoker.ErrorDataReceived += delegate (object sender, ProcessDataReceivedEventArgs message)
-                {
-                    Trace.Error($"Error on receiving memory info: {message.Data}");
-                };
-
-                var filePath = "vm_stat";
-                await processInvoker.ExecuteAsync(
-                        workingDirectory: string.Empty,
-                        fileName: filePath,
-                        arguments: string.Empty,
-                        environment: null,
-                        requireExitCodeZero: true,
-                        outputEncoding: null,
-                        killProcessOnCancel: true,
-                        cancellationToken: linkedTokenSource.Token);
-
-                var pageSize = int.Parse(outputs[0].Split(" ", StringSplitOptions.RemoveEmptyEntries)[7]);
-
-                var pagesFree = long.Parse(outputs[1].Split(" ", StringSplitOptions.RemoveEmptyEntries)[2].Trim('.'));
-                var pagesActive = long.Parse(outputs[2].Split(" ", StringSplitOptions.RemoveEmptyEntries)[2].Trim('.'));
-                var pagesInactive = long.Parse(outputs[3].Split(" ", StringSplitOptions.RemoveEmptyEntries)[2].Trim('.'));
-                var pagesSpeculative = long.Parse(outputs[4].Split(" ", StringSplitOptions.RemoveEmptyEntries)[2].Trim('.'));
-                var pagesWiredDown = long.Parse(outputs[6].Split(" ", StringSplitOptions.RemoveEmptyEntries)[3].Trim('.'));
-                var pagesOccupied = long.Parse(outputs[16].Split(" ", StringSplitOptions.RemoveEmptyEntries)[4].Trim('.'));
-
-                var freeMemory = (pagesFree + pagesInactive) * pageSize;
-                var usedMemory = (pagesActive + pagesSpeculative + pagesWiredDown + pagesOccupied) * pageSize;
-
                 lock (_memoryInfoLock)
                 {
-                    _memoryInfo.Updated = DateTime.Now;
-                    _memoryInfo.TotalMemoryMB = (freeMemory + usedMemory) / 1048576;
-                    _memoryInfo.UsedMemoryMB = usedMemory / 1048576;
+                    _memoryInfo.IsProcRunning = false;
                 }
             }
         }
         #endregion
 
         #region StringMethods
-        private async Task<string> GetCpuInfoStringAsync()
+        private async Task<string> GetCpuInfoStringAsync(CancellationToken cancellationToken)
         {
             try
             {
-                await GetCpuInfoAsync();
+                await GetCpuInfoAsync(cancellationToken);
 
                 return StringUtil.Loc("ResourceMonitorCPUInfo", $"{_cpuInfo.Usage:0.00}");
             }
@@ -428,7 +420,10 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             {
                 GetDiskInfo();
 
-                return StringUtil.Loc("ResourceMonitorDiskInfo", _diskInfo.VolumeRoot, $"{_diskInfo.FreeDiskSpaceMB:0.00}", $"{_diskInfo.TotalDiskSpaceMB:0.00}");
+                return StringUtil.Loc("ResourceMonitorDiskInfo",
+                    _diskInfo.VolumeRoot,
+                    $"{_diskInfo.FreeDiskSpaceMB:0.00}",
+                    $"{_diskInfo.TotalDiskSpaceMB:0.00}");
             }
             catch (Exception ex)
             {
@@ -436,13 +431,15 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             }
         }
 
-        private async Task<string> GetMemoryInfoStringAsync()
+        private async Task<string> GetMemoryInfoStringAsync(CancellationToken cancellationToken)
         {
             try
             {
-                await GetMemoryInfoAsync();
+                await GetMemoryInfoAsync(cancellationToken);
 
-                return StringUtil.Loc("ResourceMonitorMemoryInfo", $"{_memoryInfo.UsedMemoryMB:0.00}", $"{_memoryInfo.TotalMemoryMB:0.00}");
+                return StringUtil.Loc("ResourceMonitorMemoryInfo",
+                    $"{_memoryInfo.UsedMemoryMB:0.00}", 
+                    $"{_memoryInfo.TotalMemoryMB:0.00}");
             }
             catch (Exception ex)
             {
@@ -456,7 +453,17 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         {
             while (!_context.CancellationToken.IsCancellationRequested)
             {
-                _context.Debug(StringUtil.Loc("ResourceMonitorAgentEnvironmentResource", GetDiskInfoString(), await GetMemoryInfoStringAsync(), await GetCpuInfoStringAsync()));
+                using var timeoutTokenSource = new CancellationTokenSource();
+                timeoutTokenSource.CancelAfter(TimeSpan.FromMilliseconds(METRICS_UPDATE_INTERVAL));
+
+                using var linkedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(
+                    _context.CancellationToken,
+                    timeoutTokenSource.Token);
+
+                _context.Debug(StringUtil.Loc("ResourceMonitorAgentEnvironmentResource",
+                    GetDiskInfoString(),
+                    await GetMemoryInfoStringAsync(linkedTokenSource.Token),
+                    await GetCpuInfoStringAsync(linkedTokenSource.Token)));
 
                 await Task.Delay(ACTIVE_MODE_INTERVAL, _context.CancellationToken);
             }
@@ -475,7 +482,10 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
 
                     if (freeDiskSpacePercentage <= AVAILABLE_DISK_SPACE_PERCENTAGE_THRESHOLD)
                     {
-                        _context.Warning(StringUtil.Loc("ResourceMonitorFreeDiskSpaceIsLowerThanThreshold", _diskInfo.VolumeRoot, AVAILABLE_DISK_SPACE_PERCENTAGE_THRESHOLD, $"{usedDiskSpacePercentage:0.00}"));
+                        _context.Warning(StringUtil.Loc("ResourceMonitorFreeDiskSpaceIsLowerThanThreshold",
+                            _diskInfo.VolumeRoot,
+                            AVAILABLE_DISK_SPACE_PERCENTAGE_THRESHOLD,
+                            $"{usedDiskSpacePercentage:0.00}"));
 
                         break;
                     }
@@ -495,15 +505,24 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         {
             while (!_context.CancellationToken.IsCancellationRequested)
             {
+                using var timeoutTokenSource = new CancellationTokenSource();
+                timeoutTokenSource.CancelAfter(TimeSpan.FromMilliseconds(METRICS_UPDATE_INTERVAL));
+
+                using var linkedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(
+                    _context.CancellationToken,
+                    timeoutTokenSource.Token);
+
                 try
                 {
-                    await GetMemoryInfoAsync();
+                    await GetMemoryInfoAsync(linkedTokenSource.Token);
 
                     var usedMemoryPercentage = Math.Round(((_memoryInfo.UsedMemoryMB / (double)_memoryInfo.TotalMemoryMB) * 100.0), 2);
 
                     if (100.0 - usedMemoryPercentage <= AVAILABLE_MEMORY_PERCENTAGE_THRESHOLD)
                     {
-                        _context.Warning(StringUtil.Loc("ResourceMonitorMemorySpaceIsLowerThanThreshold", AVAILABLE_MEMORY_PERCENTAGE_THRESHOLD, $"{usedMemoryPercentage:0.00}"));
+                        _context.Warning(StringUtil.Loc("ResourceMonitorMemorySpaceIsLowerThanThreshold",
+                            AVAILABLE_MEMORY_PERCENTAGE_THRESHOLD,
+                            $"{usedMemoryPercentage:0.00}"));
 
                         break;
                     }
@@ -523,9 +542,16 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         {
             while (!_context.CancellationToken.IsCancellationRequested)
             {
+                using var timeoutTokenSource = new CancellationTokenSource();
+                timeoutTokenSource.CancelAfter(TimeSpan.FromMilliseconds(METRICS_UPDATE_INTERVAL));
+
+                using var linkedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(
+                    _context.CancellationToken,
+                    timeoutTokenSource.Token);
+
                 try
                 {
-                    await GetCpuInfoAsync();
+                    await GetCpuInfoAsync(linkedTokenSource.Token);
 
                     if (_cpuInfo.Usage >= CPU_UTILIZATION_PERCENTAGE_THRESHOLD)
                     {
