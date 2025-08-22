@@ -1,10 +1,14 @@
 {
   "private": true,
   "devDependencies": {
+<<<<<<< HEAD
     "@octokit/rest": "^16.43.2",
     "@octokit/graphql": "^7.1.1",
+=======
+    "@octokit/rest": "^17.0.0",
+>>>>>>> origin/master
     "azure-devops-node-api": "^12.0.0",
-    "azure-pipelines-task-lib": "^4.3.1",
+    "azure-pipelines-task-lib": "^4.17.3",
     "got": "^11.8.6",
     "node-getopt": "^0.3.2"
   }
